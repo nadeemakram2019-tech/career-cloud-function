@@ -5,14 +5,31 @@ const path = require("path");
 // --- API KEY & CONFIGURATION ---
 function getApiKey() {
   if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY.trim();
-  const localKey = path.join(__dirname, "API KEy.txt");
-  if (fs.existsSync(localKey)) return fs.readFileSync(localKey, "utf8").trim();
-  const parentKey = path.join(__dirname, "..", "API KEy.txt");
-  if (fs.existsSync(parentKey)) return fs.readFileSync(parentKey, "utf8").trim();
+  const envPaths = [
+    path.join(__dirname, ".env"),
+    path.join(__dirname, "..", ".env"),
+    path.join(__dirname, "API KEy.txt"),
+    path.join(__dirname, "..", "API KEy.txt"),
+    "C:\\Users\\Nadeem Akram\\Desktop\\Angular Project\\myapp\\sabrina-agents\\.env"
+  ];
+  for (const p of envPaths) {
+    if (fs.existsSync(p)) {
+      const content = fs.readFileSync(p, "utf8");
+      const match = content.match(/GEMINI_API_KEY=([^\r\n]+)/);
+      if (match) return match[1].trim();
+      return content.trim();
+    }
+  }
   return "";
 }
 
-const MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+const MODEL_QUEUE = [
+  process.env.GEMINI_MODEL,
+  "gemini-3.1-flash-lite",
+  "gemini-3.5-flash",
+  "gemini-3.8-flash"
+].filter(Boolean);
+
 const MAX_LOOPS = 5;
 
 // --- GOOGLE GEMINI LLM CALL ---
@@ -21,8 +38,6 @@ async function callLLM(agentName, messages, apiKey) {
   if (!key) {
     throw new Error("GEMINI_API_KEY is not set. Please provide it in environment variables or request.");
   }
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${key}`;
 
   let systemInstruction = undefined;
   const contents = [];
@@ -54,23 +69,42 @@ async function callLLM(agentName, messages, apiKey) {
     payload.systemInstruction = systemInstruction;
   }
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  let lastError = null;
+  for (const model of MODEL_QUEUE) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 20000);
 
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`[${agentName}] Gemini API error (${res.status}): ${errText}`);
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const errText = await res.text();
+        lastError = new Error(`[${agentName}] Gemini [${model}] error (${res.status}): ${errText}`);
+        continue;
+      }
+
+      const data = await res.json();
+      const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!reply) {
+        lastError = new Error(`[${agentName}] Gemini [${model}] returned no text: ${JSON.stringify(data)}`);
+        continue;
+      }
+      return reply.trim();
+    } catch (err) {
+      lastError = err;
+      continue;
+    }
   }
 
-  const data = await res.json();
-  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!reply) {
-    throw new Error(`[${agentName}] Gemini API returned no text: ${JSON.stringify(data)}`);
-  }
-  return reply.trim();
+  throw lastError || new Error(`[${agentName}] Failed to generate content from all Gemini models.`);
 }
 
 // --- AGENT FACTORY ---
@@ -97,19 +131,29 @@ Final Answer: <your answer>`;
     ];
 
     for (let loop = 1; loop <= MAX_LOOPS; loop++) {
+      console.log(`-> [${name}] Turn ${loop} reasoning...`);
       const llmOutput = await callLLM(name, messages, apiKey);
       messages.push({ role: "assistant", content: llmOutput });
 
-      const finalAnswer = llmOutput.match(/Final Answer:\s*([\s\S]*)/);
-      if (finalAnswer) return finalAnswer[1].trim();
+      const finalAnswer = llmOutput.match(/Final Answer:\s*([\s\S]*)/i);
+      if (finalAnswer) {
+        console.log(`   [${name}] Final answer completed.`);
+        return finalAnswer[1].trim();
+      }
 
-      const action = llmOutput.match(/Action:\s*(.+)\s*Action Input:\s*(.+)/);
-      const tool = action && tools[action[1].trim()];
-      const observation = tool
-        ? await tool.run(action[2].trim())
-        : "Invalid action. Use one of the listed tools with the exact format.";
-
-      messages.push({ role: "user", content: `Observation: ${observation}` });
+      const action = llmOutput.match(/Action:\s*([^\r\n]+)[\r\n]+(?:Action )?Input:\s*([^\r\n]+)/i);
+      if (action) {
+        const toolName = action[1].trim();
+        const toolInput = action[2].trim();
+        const tool = tools[toolName];
+        console.log(`   [${name}] Calling tool: ${toolName}("${toolInput}")`);
+        const observation = tool
+          ? await tool.run(toolInput)
+          : `Tool "${toolName}" not found. Available tools: ${Object.keys(tools).join(", ")}`;
+        messages.push({ role: "user", content: `Observation: ${observation}` });
+      } else {
+        messages.push({ role: "user", content: "Observation: Please output Action: <tool> and Action Input: <input>, or Final Answer: <answer>" });
+      }
     }
     throw new Error(`${name} did not finish within ${MAX_LOOPS} loops.`);
   }
